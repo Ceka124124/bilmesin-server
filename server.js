@@ -1,181 +1,395 @@
-const express = require('express');
-const http = require('http');
+const express    = require('express');
+const http       = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+const cors       = require('cors');
+const multer     = require('multer');
+const path       = require('path');
+const fs         = require('fs');
 
-const app = express();
+// ════════════════════════════════
+//  FIREBASE ADMIN (optional)
+// ════════════════════════════════
+let firebaseReady = false;
+try {
+  const admin = require('firebase-admin');
+  const sa    = process.env.FIREBASE_SERVICE_ACCOUNT
+    ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+    : null;
+  if (sa) {
+    admin.initializeApp({
+      credential:  admin.credential.cert(sa),
+      databaseURL: 'https://prstars-fb9b5-default-rtdb.firebaseio.com',
+    });
+    firebaseReady = true;
+    console.log('[Firebase] Admin SDK bağlandı');
+  } else {
+    console.warn('[Firebase] FIREBASE_SERVICE_ACCOUNT yoxdur — yalnız socket işləyir');
+  }
+} catch (e) {
+  console.warn('[Firebase] Yüklənmədi:', e.message);
+}
+
+// ════════════════════════════════
+//  APP SETUP
+// ════════════════════════════════
+const app    = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*', methods: ['GET','POST'] }, maxHttpBufferSize: 30e6 });
+const io     = new Server(server, {
+  cors:          { origin: '*', methods: ['GET','POST','DELETE'] },
+  transports:    ['websocket','polling'],
+  pingTimeout:   60000,
+  pingInterval:  25000,
+});
 
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-['uploads','uploads/music','uploads/images','uploads/videos'].forEach(d => {
-  const p = path.join(__dirname, d);
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+// ════════════════════════════════
+//  UPLOAD DIRS
+// ════════════════════════════════
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const MUSIC_DIR  = path.join(UPLOAD_DIR, 'music');
+const IMAGE_DIR  = path.join(UPLOAD_DIR, 'images');
+[UPLOAD_DIR, MUSIC_DIR, IMAGE_DIR].forEach(d => {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(UPLOAD_DIR));
 
-const mkStorage = (dest) => multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, dest)),
-  filename: (req, file, cb) => cb(null, Date.now() + '_' + file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_'))
+// Multer config
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, req.params.type === 'music' ? MUSIC_DIR : IMAGE_DIR);
+  },
+  filename: (req, file, cb) => {
+    const ext  = path.extname(file.originalname);
+    const name = Date.now() + '_' + Math.random().toString(36).slice(2) + ext;
+    cb(null, name);
+  },
+});
+const ALLOWED_MIME = {
+  image: ['image/jpeg','image/png','image/gif','image/webp'],
+  music: ['audio/mpeg','audio/mp4','audio/aac','audio/ogg','audio/wav',
+          'audio/flac','audio/x-m4a','audio/m4a'],
+};
+const upload = multer({
+  storage,
+  limits: { fileSize: 65 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const type = req.params.type || 'image';
+    const list = ALLOWED_MIME[type] || ALLOWED_MIME.image;
+    if (list.includes(file.mimetype)) return cb(null, true);
+    cb(new Error('Destəklənməyən fayl növü: ' + file.mimetype));
+  },
 });
 
-app.post('/api/upload/image', multer({ storage: mkStorage('uploads/images'), limits: { fileSize: 10e6 } }).single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file' });
-  res.json({ url: '/uploads/images/' + req.file.filename });
+// ════════════════════════════════
+//  IN-MEMORY STATE
+// ════════════════════════════════
+const socketUsers  = new Map(); // socketId  → userId
+const userSockets  = new Map(); // userId    → socketId
+const roomMembers  = new Map(); // roomId    → Set<userId>
+const roomOnline   = new Map(); // roomId    → Set<userId>
+const roomVideoSt  = new Map(); // roomId    → videoState obj
+
+let musicCache     = null;
+let musicCacheTime = 0;
+const CACHE_TTL    = 60_000;
+
+// ════════════════════════════════
+//  HELPERS
+// ════════════════════════════════
+function getSet(map, key) {
+  if (!map.has(key)) map.set(key, new Set());
+  return map.get(key);
+}
+function getUserSocket(userId) {
+  const sid = userSockets.get(userId);
+  return sid ? io.sockets.sockets.get(sid) : null;
+}
+function emitToUser(userId, event, data) {
+  const sock = getUserSocket(userId);
+  if (sock) sock.emit(event, data);
+}
+function readMusicList() {
+  const now = Date.now();
+  if (musicCache && now - musicCacheTime < CACHE_TTL) return musicCache;
+  try {
+    const files = fs.readdirSync(MUSIC_DIR)
+      .filter(f => /\.(mp3|m4a|aac|ogg|wav|flac)$/i.test(f));
+    musicCache = files.map(f => {
+      const metaFile = path.join(MUSIC_DIR, f + '.json');
+      if (fs.existsSync(metaFile)) {
+        try { return JSON.parse(fs.readFileSync(metaFile, 'utf8')); } catch(_) {}
+      }
+      const stat = fs.statSync(path.join(MUSIC_DIR, f));
+      return {
+        id:     f,
+        title:  f.replace(/\.[^.]+$/, '').replace(/_/g, ' '),
+        artist: 'Bilinməyən',
+        url:    `/uploads/music/${f}`,
+        size:   stat.size,
+        ts:     stat.mtimeMs,
+      };
+    }).sort((a, b) => b.ts - a.ts);
+    musicCacheTime = now;
+    return musicCache;
+  } catch(_) { return []; }
+}
+
+// ════════════════════════════════
+//  REST — Health
+// ════════════════════════════════
+app.get('/',       (_, res) => res.json({ status: 'ok', ts: Date.now() }));
+app.get('/health', (_, res) => res.json({ status: 'ok', ts: Date.now() }));
+
+// ════════════════════════════════
+//  REST — Upload
+// ════════════════════════════════
+app.post('/api/upload/:type', (req, res) => {
+  upload.single('file')(req, res, err => {
+    if (err) return res.status(400).json({ error: err.message });
+    if (!req.file) return res.status(400).json({ error: 'Fayl yoxdur' });
+
+    const type = req.params.type;
+    const url  = `/uploads/${type === 'music' ? 'music' : 'images'}/${req.file.filename}`;
+
+    if (type === 'music') {
+      const meta = {
+        id:         req.file.filename,
+        title:      req.body.title  || req.file.originalname.replace(/\.[^.]+$/, ''),
+        artist:     req.body.artist || 'Bilinməyən',
+        uploadedBy: req.body.uploadedBy || 'unknown',
+        url,
+        size: req.file.size,
+        ts:   Date.now(),
+      };
+      try { fs.writeFileSync(path.join(MUSIC_DIR, req.file.filename + '.json'), JSON.stringify(meta)); } catch(_) {}
+      musicCache = null;
+      return res.json(meta);
+    }
+    res.json({ url, filename: req.file.filename });
+  });
 });
 
-app.post('/api/upload/music', multer({ storage: mkStorage('uploads/music'), limits: { fileSize: 60e6 } }).single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file' });
-  const entry = {
-    id: 'm_' + Date.now(), title: req.body.title || req.file.originalname.replace(/\.[^.]+$/,''),
-    artist: req.body.artist || 'Naməlum', uploadedBy: req.body.uploadedBy || '',
-    url: '/uploads/music/' + req.file.filename, size: req.file.size, createdAt: Date.now()
-  };
-  const idx = path.join(__dirname, 'uploads/music/index.json');
-  let list = []; try { if (fs.existsSync(idx)) list = JSON.parse(fs.readFileSync(idx)); } catch(e){}
-  list.unshift(entry); fs.writeFileSync(idx, JSON.stringify(list));
-  res.json(entry);
-});
-
-app.post('/api/upload/file', multer({ storage: mkStorage('uploads'), limits: { fileSize: 20e6 } }).single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file' });
-  res.json({ url: '/uploads/' + req.file.filename });
+// ════════════════════════════════
+//  REST — Music
+// ════════════════════════════════
+app.get('/api/music/list', (_, res) => {
+  res.json(readMusicList());
 });
 
 app.get('/api/music/search', (req, res) => {
-  const q = (req.query.q || '').toLowerCase();
-  const idx = path.join(__dirname, 'uploads/music/index.json');
-  let list = []; try { if (fs.existsSync(idx)) list = JSON.parse(fs.readFileSync(idx)); } catch(e){}
-  res.json(q ? list.filter(m => m.title.toLowerCase().includes(q) || m.artist.toLowerCase().includes(q)) : list.slice(0,100));
+  const q    = (req.query.q || '').toLowerCase().trim();
+  const list = readMusicList();
+  if (!q) return res.json(list);
+  res.json(list.filter(m =>
+    m.title.toLowerCase().includes(q) ||
+    (m.artist || '').toLowerCase().includes(q)
+  ));
 });
 
-app.get('/api/music/list', (req, res) => {
-  const idx = path.join(__dirname, 'uploads/music/index.json');
-  let list = []; try { if (fs.existsSync(idx)) list = JSON.parse(fs.readFileSync(idx)); } catch(e){}
-  res.json(list.slice(0,100));
+app.delete('/api/music/:id', (req, res) => {
+  const id       = req.params.id;
+  const filePath = path.join(MUSIC_DIR, id);
+  const metaPath = filePath + '.json';
+  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+  musicCache = null;
+  res.json({ ok: true });
 });
 
-app.get('/', (req, res) => res.send('AEB Server v2.0'));
-app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+// ════════════════════════════════
+//  SOCKET.IO
+// ════════════════════════════════
+io.on('connection', socket => {
+  console.log(`[+] ${socket.id}`);
 
-const userSockets = {}, socketUsers = {}, roomState = {};
-
-io.on('connection', (socket) => {
+  // ─── Register ───
   socket.on('register', ({ userId }) => {
-    userSockets[userId] = socket.id; socketUsers[socket.id] = userId; socket.userId = userId;
+    if (!userId) return;
+    socketUsers.set(socket.id, userId);
+    userSockets.set(userId, socket.id);
   });
 
-  socket.on('room:join', ({ roomId, userId }) => {
-    socket.join('room:' + roomId);
-    if (!roomState[roomId]) roomState[roomId] = { seats:{}, locked:{}, muted:{}, currentMusic:null };
-    socket.emit('room:full_state', { roomId, state: roomState[roomId] });
-    socket.to('room:' + roomId).emit('room:user_joined', { userId });
-    io.to('room:' + roomId).emit('room:online_count', { count: io.sockets.adapter.rooms.get('room:'+roomId)?.size||0 });
+  // ─── Room: join ───
+  socket.on('room:join', ({ roomId, userId, nick, avatarUrl, vip }) => {
+    if (!roomId || !userId) return;
+    socket.join(roomId);
+    socketUsers.set(socket.id, userId);
+    userSockets.set(userId, socket.id);
+
+    getSet(roomMembers, roomId).add(userId);
+    getSet(roomOnline,  roomId).add(userId);
+
+    const count = getSet(roomOnline, roomId).size;
+    io.to(roomId).emit('room:online_count', { count });
+    socket.to(roomId).emit('room:user_joined', { userId, nick, avatarUrl, vip });
+
+    // Video state sync for newcomer
+    const vs = roomVideoSt.get(roomId);
+    if (vs && !vs.stopped) socket.emit('room:video_state', vs);
+
+    console.log(`[Join] ${nick || userId} → ${roomId} (${count})`);
   });
 
-  socket.on('room:leave', ({ roomId, userId }) => {
-    socket.leave('room:' + roomId);
-    if (roomState[roomId]) {
-      Object.keys(roomState[roomId].seats).forEach(k => { if (roomState[roomId].seats[k]===userId) delete roomState[roomId].seats[k]; });
-      io.to('room:'+roomId).emit('room:full_state', { roomId, state: roomState[roomId] });
-    }
-    socket.to('room:'+roomId).emit('room:user_left', { userId });
-    io.to('room:'+roomId).emit('room:online_count', { count: io.sockets.adapter.rooms.get('room:'+roomId)?.size||0 });
+  // ─── Room: leave ───
+  socket.on('room:leave', ({ roomId, userId, nick, avatarUrl }) => {
+    if (!roomId) return;
+    socket.leave(roomId);
+    _removeFromRoom(roomId, userId);
+    const count = getSet(roomOnline, roomId).size;
+    io.to(roomId).emit('room:online_count', { count });
+    socket.to(roomId).emit('room:user_left', { userId, nick, avatarUrl });
+    console.log(`[Leave] ${nick || userId} ← ${roomId} (${count})`);
+  });
+
+  socket.on('room:leave_seat', ({ roomId, userId, seatIndex }) => {
+    if (roomId) socket.to(roomId).emit('room:seat_left', { userId, seatIndex });
   });
 
   socket.on('room:take_seat', ({ roomId, userId, seatIndex }) => {
-    if (!roomState[roomId]) roomState[roomId] = { seats:{}, locked:{}, muted:{}, currentMusic:null };
-    const rs = roomState[roomId];
-    if (rs.locked[seatIndex]) return;
-    Object.keys(rs.seats).forEach(k=>{ if(rs.seats[k]===userId) delete rs.seats[k]; });
-    rs.seats[seatIndex] = userId;
-    io.to('room:'+roomId).emit('room:full_state', { roomId, state: rs });
+    if (roomId) socket.to(roomId).emit('room:seat_taken', { userId, seatIndex });
   });
 
-  socket.on('room:leave_seat', ({ roomId, userId }) => {
-    if (!roomState[roomId]) return;
-    const rs = roomState[roomId];
-    Object.keys(rs.seats).forEach(k=>{ if(rs.seats[k]===userId) delete rs.seats[k]; });
-    io.to('room:'+roomId).emit('room:full_state', { roomId, state: rs });
+  socket.on('room:add_seat', ({ roomId, seatCount }) => {
+    if (roomId) io.to(roomId).emit('room:seat_count', { seatCount });
   });
 
   socket.on('room:kick_seat', ({ roomId, seatIndex }) => {
-    if (!roomState[roomId]) return;
-    const target = roomState[roomId].seats[seatIndex];
-    if (target) {
-      delete roomState[roomId].seats[seatIndex];
-      io.to('room:'+roomId).emit('room:full_state', { roomId, state: roomState[roomId] });
-      const ts = userSockets[target]; if(ts) io.to(ts).emit('room:kicked', { roomId });
-    }
-  });
-
-  socket.on('room:mute', ({ roomId, targetUserId, muted }) => {
-    if (!roomState[roomId]) return;
-    roomState[roomId].muted[targetUserId] = muted;
-    io.to('room:'+roomId).emit('room:mute_update', { targetUserId, muted });
-    const ts = userSockets[targetUserId]; if(ts) io.to(ts).emit('room:force_mute', { muted });
+    if (roomId) io.to(roomId).emit('room:seat_kicked', { seatIndex });
   });
 
   socket.on('room:lock_seat', ({ roomId, seatIndex, locked }) => {
-    if (!roomState[roomId]) roomState[roomId] = { seats:{}, locked:{}, muted:{}, currentMusic:null };
-    roomState[roomId].locked[seatIndex] = locked;
-    io.to('room:'+roomId).emit('room:full_state', { roomId, state: roomState[roomId] });
+    if (roomId) io.to(roomId).emit('room:seat_locked', { seatIndex, locked });
   });
 
-  socket.on('room:chat', ({ roomId, data }) => { io.to('room:'+roomId).emit('room:chat', data); });
-  socket.on('room:gift', ({ roomId, data }) => { io.to('room:'+roomId).emit('room:gift', data); });
+  socket.on('room:mute', ({ roomId, targetUserId, muted }) => {
+    emitToUser(targetUserId, 'room:force_mute', { muted });
+    if (roomId) io.to(roomId).emit('room:muted_update', { userId: targetUserId, muted });
+  });
 
+  socket.on('room:kick', ({ roomId, targetUserId }) => {
+    emitToUser(targetUserId, 'room:kicked', { roomId });
+    if (roomId) io.to(roomId).emit('room:user_kicked', { userId: targetUserId });
+  });
+
+  // ─── Chat ───
+  socket.on('room:chat', ({ roomId, data }) => {
+    if (!roomId || !data) return;
+    socket.to(roomId).emit('room:chat', data);
+  });
+
+  // ─── Gift ───
+  socket.on('room:gift', ({ roomId, gift, from, fromNick }) => {
+    if (!roomId) return;
+    io.to(roomId).emit('room:gift', { gift, from, fromNick });
+  });
+
+  // ─── Music ───
   socket.on('room:music_play', ({ roomId, music }) => {
-    if (!roomState[roomId]) roomState[roomId] = { seats:{}, locked:{}, muted:{}, currentMusic:null };
-    roomState[roomId].currentMusic = music;
-    io.to('room:'+roomId).emit('room:music_play', { music });
+    if (roomId && music) socket.to(roomId).emit('room:music_play', { music });
   });
   socket.on('room:music_stop', ({ roomId }) => {
-    if(roomState[roomId]) roomState[roomId].currentMusic = null;
-    io.to('room:'+roomId).emit('room:music_stop');
+    if (roomId) socket.to(roomId).emit('room:music_stop', {});
   });
 
-  // WebRTC room
-  socket.on('rtc:offer', ({ to, from, offer, roomId }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('rtc:offer',{from,offer,roomId}); });
-  socket.on('rtc:answer', ({ to, from, answer }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('rtc:answer',{from,answer}); });
-  socket.on('rtc:ice', ({ to, from, candidate }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('rtc:ice',{from,candidate}); });
+  // ─── Video ───
+  socket.on('room:video_state', ({ roomId, videoId, startAt, title, stopped }) => {
+    if (!roomId) return;
+    const state = { roomId, videoId, startAt, title, stopped: !!stopped };
+    roomVideoSt.set(roomId, state);
+    socket.to(roomId).emit('room:video_state', state);
+  });
 
-  // Video/Voice call
-  socket.on('call:invite', ({ to, from, type, nick, avatar }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('call:invite',{from,type,nick,avatar}); });
-  socket.on('call:accept', ({ to, from }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('call:accepted',{from}); });
-  socket.on('call:reject', ({ to, from }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('call:rejected',{from}); });
-  socket.on('call:end', ({ to }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('call:ended'); });
-  socket.on('call:offer', ({ to, from, offer, type }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('call:offer',{from,offer,type}); });
-  socket.on('call:answer', ({ to, from, answer }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('call:answer',{from,answer}); });
-  socket.on('call:ice', ({ to, from, candidate }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('call:ice',{from,candidate}); });
+  // ─── Karaoke ───
+  socket.on('karaoke:vol_update', ({ roomId, musicVol }) => {
+    if (roomId) socket.to(roomId).emit('karaoke:vol_update', { musicVol });
+  });
+  socket.on('karaoke:state_update', ({ roomId, state }) => {
+    if (roomId) socket.to(roomId).emit('karaoke:state_update', { state });
+  });
+  socket.on('karaoke:next', ({ roomId }) => {
+    if (roomId) io.to(roomId).emit('karaoke:next', {});
+  });
 
-  // Chat
-  socket.on('chat:msg', ({ to, data }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('chat:msg',data); });
-  socket.on('chat:typing', ({ to, from }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('chat:typing',{from}); });
+  // ─── VIP ───
+  socket.on('vip:up', ({ nick, vip, roomId }) => {
+    const target = roomId ? io.to(roomId) : socket.broadcast;
+    target.emit('vip:up', { nick, vip });
+  });
 
-  // Social
-  socket.on('friend:req', ({ to, from, nick }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('friend:req',{from,nick}); });
-  socket.on('icon:send', ({ to, from, iconType, nick }) => { const ts=userSockets[to]; if(ts) io.to(ts).emit('icon:recv',{from,iconType,nick}); });
-  socket.on('admin:broadcast', ({ message }) => { io.emit('sys:notify',{message,ts:Date.now()}); });
+  // ─── DM ───
+  socket.on('dm:send', ({ to, from, fromNick, text }) => {
+    if (to && text) emitToUser(to, 'dm:receive', { from, fromNick, text });
+  });
 
-  socket.on('disconnect', () => {
-    const userId = socketUsers[socket.id];
-    if (userId) {
-      delete userSockets[userId]; delete socketUsers[socket.id];
-      Object.keys(roomState).forEach(rid => {
-        const rs = roomState[rid]; if(!rs) return;
-        let chg=false; Object.keys(rs.seats).forEach(k=>{ if(rs.seats[k]===userId){delete rs.seats[k];chg=true;} });
-        if(chg) io.to('room:'+rid).emit('room:full_state',{roomId:rid,state:rs});
+  // ─── Friends / Icons ───
+  socket.on('friend:req', ({ to, from, nick }) => {
+    if (to) emitToUser(to, 'friend:req', { from, nick });
+  });
+  socket.on('icon:send', ({ to, from, iconType, nick }) => {
+    if (to) emitToUser(to, 'icon:receive', { from, iconType, nick });
+  });
+
+  // ─── Sys notify (admin broadcast) ───
+  socket.on('sys:notify', ({ roomId, message }) => {
+    if (!message) return;
+    if (roomId) io.to(roomId).emit('sys:notify', { message });
+    else        io.emit('sys:notify', { message });
+  });
+
+  // ─── WebRTC signaling ───
+  socket.on('rtc:offer',  ({ to, from, offer, roomId })  => emitToUser(to, 'rtc:offer',  { from, offer, roomId }));
+  socket.on('rtc:answer', ({ to, from, answer })         => emitToUser(to, 'rtc:answer', { from, answer }));
+  socket.on('rtc:ice',    ({ to, from, candidate })      => emitToUser(to, 'rtc:ice',    { from, candidate }));
+
+  // ─── Disconnect ───
+  socket.on('disconnect', reason => {
+    const userId = socketUsers.get(socket.id);
+    socketUsers.delete(socket.id);
+    if (userId && userSockets.get(userId) === socket.id) {
+      userSockets.delete(userId);
+      // Tüm odalarda temizle
+      roomMembers.forEach((members, roomId) => {
+        if (!members.has(userId)) return;
+        _removeFromRoom(roomId, userId);
+        const count = getSet(roomOnline, roomId).size;
+        io.to(roomId).emit('room:online_count', { count });
+        io.to(roomId).emit('room:user_left', { userId, nick: userId, avatarUrl: '' });
       });
     }
+    console.log(`[-] ${socket.id} (${userId || '?'}) — ${reason}`);
   });
+
+  socket.on('error', err => console.error(`[Err] ${socket.id}:`, err.message));
 });
 
+// ════════════════════════════════
+//  INTERNAL HELPERS
+// ════════════════════════════════
+function _removeFromRoom(roomId, userId) {
+  if (!userId) return;
+  getSet(roomMembers, roomId).delete(userId);
+  getSet(roomOnline,  roomId).delete(userId);
+}
+
+// ════════════════════════════════
+//  ERROR HANDLERS
+// ════════════════════════════════
+app.use((err, req, res, _next) => {
+  console.error('[Express]', err.message);
+  res.status(500).json({ error: err.message });
+});
+process.on('uncaughtException',   err => console.error('[Uncaught]',  err.message));
+process.on('unhandledRejection',  err => console.error('[Rejection]', err?.message || err));
+
+// ════════════════════════════════
+//  START
+// ════════════════════════════════
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('AEB Server v2 port', PORT));
+server.listen(PORT, () => {
+  console.log(`\n🚀  Bilmesin Server — port ${PORT}`);
+  console.log(`    Uploads : ${UPLOAD_DIR}`);
+  console.log(`    Firebase: ${firebaseReady ? '✅' : '⚠️  yoxdur'}\n`);
+});
