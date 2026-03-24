@@ -295,11 +295,20 @@ io.on('connection', socket => {
   });
 
   // ─── Video ───
-  socket.on('room:video_state', ({ roomId, videoId, startAt, title, stopped }) => {
-    if (!roomId) return;
-    const state = { roomId, videoId, startAt, title, stopped: !!stopped };
-    roomVideoSt.set(roomId, state);
-    socket.to(roomId).emit('room:video_state', state);
+  socket.on('room:video_state', (data) => {
+    if (!data || !data.roomId) return;
+    const roomId = data.roomId;
+    const isNewFormat = data.type !== undefined || data.action !== undefined;
+    if (isNewFormat) {
+      if (data.action === 'change' || !data.action) {
+        roomVideoSt.set(roomId, data);
+      }
+      socket.to(roomId).emit('room:video_state', data);
+    } else {
+      const state = { roomId, videoId: data.videoId, startAt: data.startAt, title: data.title, stopped: !!data.stopped };
+      roomVideoSt.set(roomId, state);
+      socket.to(roomId).emit('room:video_state', state);
+    }
   });
 
   // ─── Karaoke ───
@@ -393,3 +402,22 @@ server.listen(PORT, () => {
   console.log(`    Uploads : ${UPLOAD_DIR}`);
   console.log(`    Firebase: ${firebaseReady ? '✅' : '⚠️  yoxdur'}\n`);
 });
+// ════════════════════════════════
+//  RENDER.COM SPIN-DOWN QARŞISINDAKİ SELF-PING
+//  (Pulsuz planda 15 dəqiqə sonra server yatır —
+//   hər 14 dəqiqədə özünü ping edərək oyaq saxlayır)
+// ════════════════════════════════
+const https = require('https');
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || null;
+if (SELF_URL) {
+  setInterval(() => {
+    https.get(SELF_URL + '/health', res => {
+      console.log('[KeepAlive] ping →', res.statusCode);
+    }).on('error', e => {
+      console.warn('[KeepAlive] xəta:', e.message);
+    });
+  }, 14 * 60 * 1000); // 14 dəqiqə
+  console.log('[KeepAlive] Aktiv —', SELF_URL);
+} else {
+  console.log('[KeepAlive] RENDER_EXTERNAL_URL yoxdur — spin-down qoruması deaktiv');
+}
